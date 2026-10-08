@@ -1,9 +1,9 @@
 # Generative AI Risks & Safeguards  
 ## MBAT × SEC Victoria Datathon 2026
 
-**Finalist Project | Team Untitled1 | Team of 4**
+**Finalist Project | Team Untitled1**
 
-This project was developed for the **MBAT Club Datathon 2026**, a postgraduate-focused analytics competition centred on evaluating the risks of generative AI adoption for **SEC Victoria**.
+This project was developed for the **MBAT Club Datathon 2026**, a competition for postgraduate students focused on solving a real-world problem involving generative AI risk and governance for **SEC Victoria**.
 
 Our team analysed the **AI Incident Database (AIID)** to identify recurring generative AI failure patterns, quantify how frequently they appeared across distinct incidents, and translate those findings into practical safeguards for potential use of generative AI across SEC Victoria's retail, wholesale and household-electrification operations.
 
@@ -55,7 +55,7 @@ The workflow included:
 - mapping quantified risks to SEC Victoria use cases; and
 - translating the findings into a risk-tiered safeguard framework.
 
-The database workflow was designed to perform filtering, joining and summarisation server-side where practical before transferring results into R for further analysis. This follows the size-conscious workflow recommended for the competition dataset. :chatgpt-content-reference{index="0"}
+The database workflow was designed to perform filtering, joining and summarisation server-side where practical before transferring results into R for further analysis.
 
 ---
 
@@ -80,7 +80,7 @@ The findings supported a **layered, risk-tiered approach** to generative AI adop
 ## Project Structure
 
 ```text
-mbat-ai-incident-datathon/
+mbat-2026-ai-incident-datathon-team-untitled1/
 │
 ├── README.md
 ├── _quarto.yml
@@ -126,13 +126,19 @@ Contains supporting R code used for extraction and validation.
 - `validation_pipeline.R` — MongoDB extraction, validation, joining and text-cleaning pipeline
 - `load_validation_data.R` — loads and verifies the derived validation evidence used by the report
 
-The validation loader checks that all expected evidence files are present and verifies their integrity before loading them. :chatgpt-content-reference{index="1"}
-
 ### `data/validation/`
 
-Contains small **derived validation and summary outputs** generated during the original analysis.
+Contains small derived validation and summary outputs generated during the original analysis.
 
-These are not raw AIID article dumps. The directory contains aggregate evidence for publication dates, source domains, report-to-incident joins, text cleaning and validation checks. :chatgpt-content-reference{index="2"}
+These include:
+
+- publication-date validation;
+- source-domain summaries;
+- report-to-incident join checks;
+- text-cleaning audits; and
+- validation checks.
+
+Raw AIID article text and MongoDB credentials are not included.
 
 ### `outputs/`
 
@@ -142,13 +148,13 @@ Contains the rendered competition deliverables:
 - `report.pdf`
 - `slides.html`
 
-The accompanying `report_files/` and `slides_files/` directories contain the assets required by the rendered interactive HTML documents.
+The accompanying `report_files/` and `slides_files/` directories contain the assets required by the rendered HTML documents.
 
 ---
 
-## Tools & Technologies
+## Tools Used
 
-**Languages & analysis**
+### Data Analysis
 
 - R
 - tidyverse
@@ -156,7 +162,7 @@ The accompanying `report_files/` and `slides_files/` directories contain the ass
 - tidyr
 - ggplot2
 
-**Text analytics**
+### Text Analysis
 
 - tidytext
 - textclean
@@ -165,7 +171,7 @@ The accompanying `report_files/` and `slides_files/` directories contain the ass
 - n-gram analysis
 - rule-based text classification
 
-**Data engineering**
+### Data Engineering
 
 - MongoDB Atlas
 - mongolite
@@ -173,34 +179,14 @@ The accompanying `report_files/` and `slides_files/` directories contain the ass
 - JSON / BSON
 - server-side filtering and joins
 
-**Reporting & visualisation**
+### Reporting & Visualisation
 
 - Quarto
 - Plotly
 - reveal.js
 - HTML / PDF reporting
 
-The original pipeline uses environment variables rather than embedding MongoDB credentials directly in source code. :chatgpt-content-reference{index="3"}
-
----
-
-## Data Access & Reproducibility
-
-The original competition analysis used a **MongoDB Atlas instance provided by the MBAT Datathon organisers** containing the AI Incident Database.
-
-At the time of the competition, the project was designed to run from the Quarto source files using a locally configured `MONGO_URI` environment variable.
-
-The competition-provided Atlas instance is **no longer available**, so the original database extraction cannot currently be rerun from this repository.
-
-For this reason:
-
-- MongoDB credentials are **not included**;
-- raw AIID article text is **not included**;
-- the original analysis code has been preserved;
-- derived validation outputs from the successful competition run are retained; and
-- the original rendered report and presentation are preserved in `outputs/`.
-
-The validation data includes metadata from the original extraction, including package versions and summary metrics from the successful run. :chatgpt-content-reference{index="4"}
+The original pipeline uses environment variables rather than embedding MongoDB credentials directly in source code.
 
 ---
 
@@ -223,14 +209,6 @@ Key limitations include:
 
 ## Repository Note
 
-This repository is a cleaned public version of the original **Team Untitled1 MBAT Datathon 2026 submission**.
+The original competition MongoDB Atlas instance is no longer available, so the database extraction cannot currently be rerun.
 
-Temporary development files, credentials, raw article text and competition working files have been excluded. The final report, presentation, analysis source code and non-sensitive derived validation outputs have been retained to document the team's analytical workflow and results.
-
----
-
-## Acknowledgements
-
-Developed as part of the **MBAT Club Datathon 2026** using the **AI Incident Database (AIID)** for a challenge focused on generative AI risks and safeguards for **SEC Victoria**.
-
-All analysis and recommendations in this repository were produced as part of the datathon competition and should not be interpreted as an official SEC Victoria risk assessment.
+The original competition deliverables are preserved in `outputs/`, including the rendered **HTML report, PDF report and presentation slides**.
