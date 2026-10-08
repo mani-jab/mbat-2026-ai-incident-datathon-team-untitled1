@@ -1,0 +1,17 @@
+"check","passed"
+"selected_report_ids_unique",TRUE
+"report_incident_pairs_unique",TRUE
+"selected_and_joined_report_sets_equal",TRUE
+"eligible_count_reconciles",TRUE
+"matched_count_reconciles",TRUE
+"unmatched_count_reconciles",TRUE
+"multiple_links_reconcile",TRUE
+"joined_row_count_reconciles",TRUE
+"matched_percentage_reconciles",TRUE
+"cleaning_population_reconciles",TRUE
+"missing_body_count_reconciles",TRUE
+"empty_original_count_reconciles",TRUE
+"usable_body_count_reconciles",TRUE
+"removed_body_count_reconciles",TRUE
+"duplicate_body_group_count_reconciles",TRUE
+"small_R_and_MongoDB_join_comparison_agrees",TRUE

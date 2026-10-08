@@ -1,0 +1,2687 @@
+---
+title: "AI Incident Database Datathon Report"
+subtitle: "Generative AI Risks and Safeguards for SEC Victoria"
+format:
+  html:
+    toc: true
+    code-fold: true
+    code-tools: true
+  pdf:
+    toc: true
+number-sections: true
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+# Project Setup
+
+This report analyses the AI Incident Database (AIID) to identify recurring generative AI failure patterns and assess what those patterns could mean for SEC Victoria if internal generative AI tools were deployed across retail, wholesale and household-electrification operations.
+
+The analysis follows four questions:
+
+1.  What failure patterns repeatedly appear in generative AI incidents?
+2.  How common are those patterns across distinct incidents?
+3.  Which of those risks are most relevant to SEC Victoria's proposed internal uses?
+4.  What practical safeguards are supported by the incident evidence?
+
+```{r}
+#| label: setup
+#| include: false
+
+library(mongolite)
+library(tidyverse)
+library(tidytext)
+library(janitor)
+library(lubridate)
+library(here)
+library(jsonlite)
+library(plotly)
+library(purrr)
+library(textclean)
+```
+
+```{r}
+#| label: analysis-settings
+#| include: false
+
+analysis_end <- as.Date("2026-09-21")
+
+pct <- function(x, digits = 1) {
+  paste0(round(x, digits), "%")
+}
+```
+
+```{r}
+#| label: interactive-plot-helper
+#| include: false
+
+show_interactive <- function(p, tooltip = "text") {
+  if (knitr::is_html_output()) {
+    plotly::ggplotly(
+      p,
+      tooltip = tooltip
+    ) |>
+      plotly::config(
+        displayModeBar = FALSE,
+        responsive = TRUE
+      )
+  } else {
+    p
+  }
+}
+```
+
+# Data Source and Collection Structure
+
+The analysis uses the AI Incident Database collections for `reports` and `incidents`.
+
+A report represents a source document describing an AI-related event, while an incident represents the underlying event recorded by AIID. Multiple reports may therefore describe the same incident.
+
+This distinction is important for the SEC Victoria question because counting reports alone could make highly publicised failures appear more common than failures that received less media attention.
+
+## Connect to MongoDB
+
+```{r}
+#| label: connect-to-mongodb
+#| include: false
+
+db_name <- "aiidprod"
+
+reports_conn <- mongo(
+  collection = "reports",
+  db = db_name,
+  url = Sys.getenv("MONGO_URI")
+)
+
+incidents_conn <- mongo(
+  collection = "incidents",
+  db = db_name,
+  url = Sys.getenv("MONGO_URI")
+)
+```
+
+## Collection Sizes
+
+```{r}
+#| label: collection-sizes
+
+n_reports <- reports_conn$count()
+n_incidents <- incidents_conn$count()
+
+collection_sizes <- tibble(
+  Collection = c("Reports", "Incidents"),
+  Records = c(n_reports, n_incidents)
+)
+
+knitr::kable(
+  collection_sizes,
+  caption = "Size of the two AIID collections used in the analysis."
+)
+```
+
+These two collections serve different purposes. Reports provide detailed source text, while incidents provide the appropriate unit for estimating how widely a failure pattern occurs.
+
+## Report Characteristics
+
+The database contains reports in multiple languages and includes an `is_incident_report` classification. These fields are inspected for data-quality purposes rather than used as automatic exclusion rules.
+
+```{r}
+#| label: report-characteristics
+
+n_reports_en <- reports_conn$count(
+  '{"language": "en"}'
+)
+
+n_incident_reports <- reports_conn$count(
+  '{"is_incident_report": true}'
+)
+
+n_reports_en_incident <- reports_conn$count(
+  '{
+    "language": "en",
+    "is_incident_report": true
+  }'
+)
+
+report_characteristics <- tibble(
+  Measure = c(
+    "English-language reports",
+    "Reports marked as incident reports",
+    "English reports marked as incident reports"
+  ),
+  Reports = c(
+    n_reports_en,
+    n_incident_reports,
+    n_reports_en_incident
+  )
+)
+
+knitr::kable(
+  report_characteristics,
+  caption = "Selected characteristics of the AIID reports collection."
+)
+```
+
+### Most Common Report Languages
+
+```{r}
+#| label: reports-by-language
+
+reports_by_language <- reports_conn$aggregate('[
+  {
+    "$group": {
+      "_id": "$language",
+      "n_reports": { "$sum": 1 }
+    }
+  },
+  {
+    "$sort": {
+      "n_reports": -1
+    }
+  }
+]') |>
+  as_tibble() |>
+  rename(
+    language = `_id`
+  ) |>
+  mutate(
+    language = replace_na(language, "Missing")
+  )
+
+reports_by_language |>
+  slice_head(n = 10) |>
+  rename(
+    Language = language,
+    Reports = n_reports
+  ) |>
+  knitr::kable(
+    caption = "Ten most common language labels in the reports collection."
+  )
+```
+
+No language filter is applied to the main dataset. However, later keyword-based text classification is primarily English-focused, which is treated as a limitation rather than silently removing non-English observations.
+
+## Reports Over Time
+
+```{r}
+#| label: reports-over-time
+
+reports_by_year <- reports_conn$aggregate('[
+  {
+    "$match": {
+      "date_published": { "$ne": null }
+    }
+  },
+  {
+    "$group": {
+      "_id": {
+        "$year": "$date_published"
+      },
+      "n_reports": { "$sum": 1 }
+    }
+  },
+  {
+    "$sort": {
+      "_id": 1
+    }
+  }
+]') |>
+  as_tibble() |>
+  rename(
+    year = `_id`
+  )
+```
+
+```{r}
+#| label: fig-reports-by-year
+#| fig-cap: "Number of AIID reports by publication year."
+
+reports_year_plot <- reports_by_year |>
+  filter(
+    year >= 1967,
+    year <= year(analysis_end)
+  ) |>
+  mutate(
+    hover_text = str_c(
+      "<b>Year: ",
+      year,
+      "</b>",
+      "<br>Reports: ",
+      scales::comma(n_reports)
+    )
+  ) |>
+  ggplot(
+    aes(
+      x = year,
+      y = n_reports,
+      fill = n_reports,
+      text = hover_text
+    )
+  ) +
+  geom_col() +
+  scale_fill_viridis_c(
+    option = "C",
+    guide = "none"
+  ) +
+  scale_x_continuous(
+    breaks = seq(1970, 2025, by = 5)
+  ) +
+  labs(
+    x = "Publication year",
+    y = "Number of reports"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+
+show_interactive(
+  reports_year_plot,
+  tooltip = "text"
+)
+```
+
+The series describes publication activity rather than the exact timing of the underlying incidents. A later publication can describe an earlier event.
+
+# Data Quality and Preparation
+
+## Reports per Incident
+
+One incident can be supported by many separate reports. This creates an important analytical issue: counting words or topics at report level can give highly reported incidents disproportionate influence.
+
+```{r}
+#| label: reports-per-incident
+
+reports_per_incident <- incidents_conn$aggregate('[
+  {
+    "$project": {
+      "_id": 0,
+      "incident_id": 1,
+      "title": 1,
+      "n_reports": {
+        "$size": {
+          "$ifNull": ["$reports", []]
+        }
+      }
+    }
+  },
+  {
+    "$sort": {
+      "n_reports": -1
+    }
+  }
+]') |>
+  as_tibble()
+```
+
+```{r}
+#| label: reports-per-incident-summary
+
+reports_per_incident_summary <- reports_per_incident |>
+  summarise(
+    Incidents = n(),
+    `Median reports` = median(n_reports),
+    `Mean reports` = round(mean(n_reports), 2),
+    `Maximum reports` = max(n_reports)
+  )
+
+knitr::kable(
+  reports_per_incident_summary,
+  caption = "Number of reports linked to each AIID incident."
+)
+```
+
+```{r}
+#| label: fig-reports-per-incident
+#| fig-cap: "Distribution of the number of source reports linked to each incident."
+
+reports_per_incident_plot <- reports_per_incident |>
+  count(n_reports) |>
+  filter(n_reports <= 20) |>
+  mutate(
+    hover_text = str_c(
+      "<b>",
+      n_reports,
+      " linked report",
+      if_else(n_reports == 1, "", "s"),
+      "</b>",
+      "<br>Incidents: ",
+      scales::comma(n)
+    )
+  ) |>
+  ggplot(
+    aes(
+      x = n_reports,
+      y = n,
+      fill = n,
+      text = hover_text
+    )
+  ) +
+  geom_col() +
+  scale_fill_viridis_c(
+    option = "D",
+    guide = "none"
+  ) +
+  labs(
+    x = "Reports linked to incident",
+    y = "Number of incidents"
+  ) +
+  theme_minimal()
+
+show_interactive(
+  reports_per_incident_plot,
+  tooltip = "text"
+)
+```
+
+The figure is restricted to incidents with up to 20 reports so that the main distribution remains readable. Incidents with larger numbers of reports are retained in the analysis.
+
+Because reporting intensity is uneven, the main risk findings later in this report are calculated using **distinct incidents**, not raw report frequencies.
+
+## Identifier Uniqueness
+
+```{r}
+#| label: identifier-uniqueness
+
+reports_id_check <- reports_conn$aggregate('[
+  {
+    "$group": {
+      "_id": "$report_number",
+      "n": { "$sum": 1 }
+    }
+  },
+  {
+    "$match": {
+      "n": { "$gt": 1 }
+    }
+  }
+]') |>
+  as_tibble()
+
+incidents_id_check <- incidents_conn$aggregate('[
+  {
+    "$group": {
+      "_id": "$incident_id",
+      "n": { "$sum": 1 }
+    }
+  },
+  {
+    "$match": {
+      "n": { "$gt": 1 }
+    }
+  }
+]') |>
+  as_tibble()
+
+identifier_check <- tibble(
+  Identifier = c(
+    "report_number",
+    "incident_id"
+  ),
+  `Duplicate values` = c(
+    nrow(reports_id_check),
+    nrow(incidents_id_check)
+  )
+)
+
+knitr::kable(
+  identifier_check,
+  caption = "Duplicate identifier checks."
+)
+```
+
+A result of zero indicates that the identifier is unique within its collection.
+
+## Create Reduced Working Datasets
+
+Only fields required for quality checks, joins and the later incident analysis are extracted.
+
+```{r}
+#| label: reduced-incidents
+#| include: false
+
+incidents_filtered <- incidents_conn$find(
+  fields = '{
+    "_id": 0,
+    "incident_id": 1,
+    "title": 1,
+    "description": 1,
+    "date": 1,
+    "reports": 1,
+    "implicated_systems": 1,
+    "Alleged deployer of AI system": 1,
+    "Alleged developer of AI system": 1,
+    "Alleged harmed or nearly harmed parties": 1,
+    "nlp_similar_incidents": 1,
+    "editor_similar_incidents": 1,
+    "editor_dissimilar_incidents": 1,
+    "flagged_dissimilar_incidents": 1,
+    "editor_notes": 1,
+    "created_at": 1,
+    "date_modified": 1
+  }'
+) |>
+  as_tibble()
+```
+
+```{r}
+#| label: reduced-reports
+#| include: false
+
+reports_filtered <- reports_conn$find(
+  fields = '{
+    "_id": 0,
+    "report_number": 1,
+    "title": 1,
+    "description": 1,
+    "plain_text": 1,
+    "url": 1,
+    "source_domain": 1,
+    "authors": 1,
+    "submitters": 1,
+    "language": 1,
+    "tags": 1,
+    "date_published": 1,
+    "date_submitted": 1,
+    "date_downloaded": 1,
+    "date_modified": 1,
+    "is_incident_report": 1,
+    "flag": 1,
+    "editor_notes": 1,
+    "created_at": 1
+  }'
+) |>
+  as_tibble()
+```
+
+## Missing-Value Checks
+
+```{r}
+#| label: missing-values-reports
+
+report_missingness <- reports_filtered |>
+  summarise(
+    `Report number` = sum(is.na(report_number)),
+    Title = sum(is.na(title) | trimws(title) == ""),
+    Description = sum(is.na(description) | trimws(description) == ""),
+    `Plain text` = sum(is.na(plain_text) | trimws(plain_text) == ""),
+    Language = sum(is.na(language) | trimws(language) == ""),
+    `Publication date` = sum(is.na(date_published)),
+    `Source domain` = sum(is.na(source_domain) | trimws(source_domain) == ""),
+    URL = sum(is.na(url) | trimws(url) == "")
+  ) |>
+  pivot_longer(
+    everything(),
+    names_to = "Field",
+    values_to = "Missing"
+  )
+
+knitr::kable(
+  report_missingness,
+  caption = "Missing values in selected report fields."
+)
+```
+
+```{r}
+#| label: missing-values-incidents
+
+incident_missingness <- incidents_filtered |>
+  summarise(
+    `Incident ID` = sum(is.na(incident_id)),
+    Title = sum(is.na(title) | trimws(title) == ""),
+    Description = sum(is.na(description) | trimws(description) == ""),
+    Date = sum(is.na(date) | trimws(date) == ""),
+    `No linked reports` = sum(lengths(reports) == 0),
+    `No implicated system` = sum(lengths(implicated_systems) == 0),
+    `No alleged deployer` =
+      sum(lengths(`Alleged deployer of AI system`) == 0),
+    `No alleged developer` =
+      sum(lengths(`Alleged developer of AI system`) == 0),
+    `No harmed party` =
+      sum(lengths(`Alleged harmed or nearly harmed parties`) == 0)
+  ) |>
+  pivot_longer(
+    everything(),
+    names_to = "Field",
+    values_to = "Missing"
+  )
+
+knitr::kable(
+  incident_missingness,
+  caption = "Missing values in selected incident fields."
+)
+```
+
+These checks determine which fields can support later conclusions. Missing data are not automatically interpreted as evidence that a characteristic was absent from an incident.
+
+# Joining Reports to Incidents
+
+The `incidents.reports` field stores report identifiers. Reports are therefore joined to incidents by matching `reports.report_number` to the report identifiers stored within each incident.
+
+## MongoDB Join
+
+```{r}
+#| label: mongodb-report-incident-join
+#| include: false
+
+reports_incidents_joined <- reports_conn$aggregate('[
+  {
+    "$lookup": {
+      "from": "incidents",
+      "localField": "report_number",
+      "foreignField": "reports",
+      "as": "incident"
+    }
+  },
+  {
+    "$unwind": {
+      "path": "$incident",
+      "preserveNullAndEmptyArrays": true
+    }
+  },
+  {
+    "$project": {
+      "_id": 0,
+      "report_number": 1,
+      "report_title": "$title",
+      "report_description": "$description",
+      "plain_text": 1,
+      "url": 1,
+      "source_domain": 1,
+      "authors": 1,
+      "submitters": 1,
+      "language": 1,
+      "tags": 1,
+      "date_published": 1,
+      "date_submitted": 1,
+      "date_downloaded": 1,
+      "date_modified": 1,
+      "is_incident_report": 1,
+      "flag": 1,
+      "incident_id": "$incident.incident_id",
+      "incident_title": "$incident.title",
+      "incident_description": "$incident.description",
+      "incident_date": "$incident.date",
+      "implicated_systems": "$incident.implicated_systems",
+      "alleged_deployer": "$incident.Alleged deployer of AI system",
+      "alleged_developer": "$incident.Alleged developer of AI system",
+      "alleged_harmed_parties": "$incident.Alleged harmed or nearly harmed parties"
+    }
+  }
+]') |>
+  as_tibble()
+```
+
+A row in this dataset represents a **report-incident relationship**, not necessarily a unique report or a unique incident.
+
+## Validate the Join
+
+```{r}
+#| label: join-link-summary
+
+link_summary <- reports_incidents_joined |>
+  summarise(
+    `Joined rows` = n(),
+    `Unique reports` = n_distinct(report_number),
+    `Unique linked incidents` =
+      n_distinct(incident_id, na.rm = TRUE),
+    `Reports without matched incident` =
+      sum(is.na(incident_id))
+  ) |>
+  pivot_longer(
+    everything(),
+    names_to = "Measure",
+    values_to = "Value"
+  )
+
+knitr::kable(
+  link_summary,
+  caption = "Summary of the report-incident join."
+)
+```
+
+## Reports Linked to Multiple Incidents
+
+```{r}
+#| label: reports-multiple-incidents
+
+reports_multiple_incidents <- reports_incidents_joined |>
+  filter(!is.na(incident_id)) |>
+  group_by(report_number) |>
+  summarise(
+    n_incidents = n_distinct(incident_id),
+    .groups = "drop"
+  ) |>
+  filter(n_incidents > 1) |>
+  arrange(desc(n_incidents))
+
+multiple_link_summary <- tibble(
+  Measure = c(
+    "Reports linked to more than one incident",
+    "Maximum incidents linked to one report"
+  ),
+  Value = c(
+    nrow(reports_multiple_incidents),
+    ifelse(
+      nrow(reports_multiple_incidents) == 0,
+      1,
+      max(reports_multiple_incidents$n_incidents)
+    )
+  )
+)
+
+knitr::kable(
+  multiple_link_summary,
+  caption = "Reports linked to multiple AIID incidents."
+)
+```
+
+## Cross-Check Incident Report Counts
+
+```{r}
+#| label: report-count-check
+
+reports_per_incident_joined <- reports_incidents_joined |>
+  filter(!is.na(incident_id)) |>
+  group_by(incident_id) |>
+  summarise(
+    n_reports_joined = n_distinct(report_number),
+    .groups = "drop"
+  )
+
+report_count_check <- reports_per_incident |>
+  select(
+    incident_id,
+    n_reports_original = n_reports
+  ) |>
+  left_join(
+    reports_per_incident_joined,
+    by = "incident_id"
+  ) |>
+  mutate(
+    n_reports_joined = coalesce(n_reports_joined, 0L),
+    difference =
+      n_reports_original - n_reports_joined
+  ) |>
+  filter(difference != 0)
+
+join_validation <- tibble(
+  Measure = c(
+    "Incidents with different reconstructed report counts",
+    "Join validation result"
+  ),
+  Result = c(
+    as.character(nrow(report_count_check)),
+    ifelse(
+      nrow(report_count_check) == 0,
+      "No discrepancies detected",
+      "Discrepancies detected"
+    )
+  )
+)
+
+knitr::kable(
+  join_validation,
+  caption = "Validation of report counts reconstructed through the join."
+)
+```
+
+This validation reduces the risk that later failure-pattern estimates are driven by an incorrect report-incident relationship.
+
+# Reproducibility and Transformation Checks
+
+Sections of the team workflow also independently validate date handling, server-side transformation, joining and text cleaning.
+
+```{r}
+#| label: sec679-load-published-evidence
+#| include: false
+#| cache: false
+
+source(
+  here::here(
+    "src",
+    "load_validation_data.R"
+  )
+)
+
+validation_evidence <- load_validation_data()
+
+s679_evidence <- validation_evidence
+s679 <- s679_evidence$summary
+s679_m <- s679$metrics
+s679_domains <- s679_evidence$domain_summary
+
+s679_read <- function(name) {
+  s679_evidence[[name]]
+}
+
+s679_pct <- function(x) {
+  sprintf("%.2f", x)
+}
+
+s679_audit_table <- function(name) {
+
+  x <- s679_read(name)
+
+  names(x)[1:2] <- c(
+    "Audit measure",
+    "Result"
+  )
+
+  x |>
+    mutate(
+      Result = as.character(Result),
+      Result = ifelse(
+        grepl(
+          "percent",
+          `Audit measure`,
+          ignore.case = TRUE
+        ) &
+          !is.na(
+            suppressWarnings(
+              as.numeric(Result)
+            )
+          ),
+        paste0(
+          s679_pct(
+            as.numeric(Result)
+          ),
+          "%"
+        ),
+        Result
+      )
+    )
+}
+```
+
+## Date and Scope Audit
+
+```{r}
+#| label: date-audit
+
+knitr::kable(
+  s679_audit_table("date_audit"),
+  caption = "Audit of publication-date fields used in the server-side workflow."
+)
+```
+
+The server-side workflow uses a half-open date interval so that the end boundary is unambiguous.
+
+## Source-Domain Distribution
+
+```{r}
+#| label: top-source-domains
+
+s679_domains |>
+  arrange(desc(n_reports)) |>
+  slice_head(n = 10) |>
+  rename(
+    `Source domain` = source_domain,
+    Reports = n_reports
+  ) |>
+  knitr::kable(
+    caption = "Most common source domains in the server-side analytical window."
+  )
+```
+
+```{r}
+#| label: fig-top-source-domains
+#| fig-cap: "Most common source domains in the server-side analytical window."
+
+source_domain_plot <- s679_domains |>
+  arrange(desc(n_reports)) |>
+  slice_head(n = 15) |>
+  mutate(
+    source_domain = forcats::fct_reorder(
+      source_domain,
+      n_reports
+    ),
+    hover_text = str_c(
+      "<b>",
+      source_domain,
+      "</b>",
+      "<br>Reports: ",
+      scales::comma(n_reports)
+    )
+  ) |>
+  ggplot(
+    aes(
+      x = source_domain,
+      y = n_reports,
+      fill = n_reports,
+      text = hover_text
+    )
+  ) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_viridis_c(
+    option = "B",
+    guide = "none"
+  ) +
+  labs(
+    x = NULL,
+    y = "Number of reports"
+  ) +
+  theme_minimal()
+
+show_interactive(
+  source_domain_plot,
+  tooltip = "text"
+)
+```
+
+Source domains describe where reports were published. They are not treated as independent incidents or as measures of incident severity.
+
+## Server-Side and R-Side Join Validation
+
+```{r}
+#| label: join-audit
+
+knitr::kable(
+  s679_audit_table("join_audit"),
+  caption = "Independent validation of server-side and R-side joins."
+)
+```
+
+Agreement is tested using report-incident identifier pairs rather than relying only on equal row counts.
+
+## Text-Cleaning Audit
+
+```{r}
+#| label: cleaning-audit
+
+knitr::kable(
+  s679_audit_table("cleaning_audit"),
+  caption = "Quality checks applied to cleaned report text."
+)
+```
+
+Text cleaning is intentionally conservative. Original text is retained and cleaned text is stored separately so transformations can be audited.
+
+# Defining the Generative AI Analysis Population
+
+The challenge concerns generative AI rather than every form of artificial intelligence represented in AIID.
+
+A reproducible indicator is therefore used to identify incidents whose titles, descriptions or associated reports contain clear generative-AI terminology or major generative-AI system names.
+
+This is a screening method rather than an official AIID taxonomy.
+
+## Build One Text Record per Incident
+
+```{r}
+#| label: incident-analysis-text
+
+incident_analysis_text <- reports_incidents_joined |>
+  filter(
+    !is.na(incident_id)
+  ) |>
+  group_by(
+    incident_id,
+    incident_title,
+    incident_description,
+    incident_date
+  ) |>
+  summarise(
+    n_linked_reports =
+      n_distinct(report_number),
+
+    report_languages =
+      str_c(
+        sort(
+          unique(
+            na.omit(language)
+          )
+        ),
+        collapse = ", "
+      ),
+
+    report_text =
+      str_c(
+        unique(
+          plain_text[
+            !is.na(plain_text) &
+              str_trim(plain_text) != ""
+          ]
+        ),
+        collapse = " "
+      ),
+
+    .groups = "drop"
+  ) |>
+  mutate(
+    analysis_text =
+      str_to_lower(
+        str_c(
+          coalesce(
+            incident_title,
+            ""
+          ),
+          coalesce(
+            incident_description,
+            ""
+          ),
+          coalesce(
+            report_text,
+            ""
+          ),
+          sep = " "
+        )
+      )
+  )
+```
+
+Working at incident level prevents incidents with many media reports from automatically receiving more weight.
+
+## Identify Generative AI Incidents
+
+```{r}
+#| label: identify-genai-incidents
+
+genai_pattern <- regex(
+  paste(
+    c(
+      "generative ai",
+      "generative artificial intelligence",
+      "large language model",
+      "large language models",
+      "\\bllm\\b",
+      "\\bllms\\b",
+      "chatgpt",
+      "openai",
+      "gpt-3",
+      "gpt-4",
+      "gpt-5",
+      "gemini",
+      "bard",
+      "claude",
+      "copilot",
+      "dall-e",
+      "dall·e",
+      "midjourney",
+      "stable diffusion",
+      "text generator",
+      "image generator",
+      "generative model",
+      "generative models"
+    ),
+    collapse = "|"
+  ),
+  ignore_case = TRUE
+)
+
+incident_analysis_text <- incident_analysis_text |>
+  mutate(
+    genai_indicator =
+      str_detect(
+        analysis_text,
+        genai_pattern
+      )
+  )
+
+genai_incidents <- incident_analysis_text |>
+  filter(genai_indicator)
+
+n_genai_incidents <- nrow(genai_incidents)
+```
+
+```{r}
+#| label: genai-scope-summary
+
+genai_scope <- tibble(
+  Measure = c(
+    "Total AIID incidents",
+    "Incidents with linked report text",
+    "Incidents identified by the GenAI screen",
+    "GenAI screen share of all incidents"
+  ),
+  Result = c(
+    format(
+      n_incidents,
+      big.mark = ","
+    ),
+    format(
+      n_distinct(
+        incident_analysis_text$incident_id
+      ),
+      big.mark = ","
+    ),
+    format(
+      n_genai_incidents,
+      big.mark = ","
+    ),
+    pct(
+      100 *
+        n_genai_incidents /
+        n_incidents
+    )
+  )
+)
+
+knitr::kable(
+  genai_scope,
+  caption = "Scope of the generative AI incident screen."
+)
+```
+
+The GenAI screen is intentionally reproducible and conservative, but it can miss incidents that involve generative AI without using the selected terminology.
+
+# Exploratory Text Analysis
+
+Text analysis is used to identify recurring language and help develop interpretable failure categories. Word frequencies are treated as exploratory evidence rather than as the final measure of risk.
+
+## Prepare Linked Text
+
+```{r}
+#| label: prepare-text-data
+
+text_data <- reports_incidents_joined |>
+  filter(
+    !is.na(incident_id),
+    !is.na(plain_text),
+    str_trim(plain_text) != ""
+  ) |>
+  select(
+    report_number,
+    incident_id,
+    incident_title,
+    language,
+    plain_text
+  )
+```
+
+## Tokenisation and Cleaning
+
+```{r}
+#| label: tokenisation-cleaning
+#| include: false
+
+tokens_clean <- text_data |>
+  select(
+    report_number,
+    incident_id,
+    plain_text
+  ) |>
+  unnest_tokens(
+    word,
+    plain_text
+  ) |>
+  anti_join(
+    stop_words,
+    by = "word"
+  ) |>
+  filter(
+    str_detect(
+      word,
+      "[[:alpha:]]"
+    ),
+    str_length(word) > 2
+  )
+
+custom_stop_words <- tibble(
+  word = c(
+    "people",
+    "company",
+    "companies",
+    "time",
+    "including",
+    "told",
+    "technology",
+    "technologies",
+    "artificial",
+    "intelligence",
+    "report",
+    "reports",
+    "media",
+    "system",
+    "systems"
+  )
+)
+
+tokens_risk <- tokens_clean |>
+  anti_join(
+    custom_stop_words,
+    by = "word"
+  )
+```
+
+## Incident-Level Word Prevalence
+
+```{r}
+#| label: incident-word-prevalence
+
+n_incidents_text <-
+  n_distinct(
+    text_data$incident_id
+  )
+
+incident_word_prevalence <- tokens_risk |>
+  distinct(
+    incident_id,
+    word
+  ) |>
+  count(
+    word,
+    sort = TRUE
+  ) |>
+  mutate(
+    pct_incidents =
+      100 *
+      n /
+      n_incidents_text
+  )
+
+incident_word_prevalence |>
+  slice_head(n = 20) |>
+  rename(
+    Word = word,
+    Incidents = n,
+    `Incident prevalence (%)` =
+      pct_incidents
+  ) |>
+  mutate(
+    `Incident prevalence (%)` =
+      round(
+        `Incident prevalence (%)`,
+        1
+      )
+  ) |>
+  knitr::kable(
+    caption = "Common words measured by distinct incident prevalence."
+  )
+```
+
+This measure counts an incident once regardless of how many times a word appears in reports about that incident.
+
+## Bigram Analysis
+
+```{r}
+#| label: incident-bigrams
+#| include: false
+
+bigrams <- text_data |>
+  select(
+    report_number,
+    incident_id,
+    plain_text
+  ) |>
+  unnest_tokens(
+    bigram,
+    plain_text,
+    token = "ngrams",
+    n = 2
+  ) |>
+  separate(
+    bigram,
+    into = c(
+      "word1",
+      "word2"
+    ),
+    sep = " "
+  ) |>
+  filter(
+    !word1 %in% stop_words$word,
+    !word2 %in% stop_words$word,
+    str_detect(
+      word1,
+      "[[:alpha:]]"
+    ),
+    str_detect(
+      word2,
+      "[[:alpha:]]"
+    ),
+    !word1 %in% custom_stop_words$word,
+    !word2 %in% custom_stop_words$word
+  )
+
+incident_bigram_prevalence <- bigrams |>
+  distinct(
+    incident_id,
+    word1,
+    word2
+  ) |>
+  count(
+    word1,
+    word2,
+    sort = TRUE
+  ) |>
+  mutate(
+    phrase =
+      str_c(
+        word1,
+        word2,
+        sep = " "
+      ),
+    pct_incidents =
+      100 *
+      n /
+      n_incidents_text
+  )
+```
+
+```{r}
+#| label: top-bigram-table
+
+incident_bigram_prevalence |>
+  select(
+    phrase,
+    n,
+    pct_incidents
+  ) |>
+  slice_head(n = 15) |>
+  rename(
+    Phrase = phrase,
+    Incidents = n,
+    `Incident prevalence (%)` =
+      pct_incidents
+  ) |>
+  mutate(
+    `Incident prevalence (%)` =
+      round(
+        `Incident prevalence (%)`,
+        1
+      )
+  ) |>
+  knitr::kable(
+    caption = "Common two-word phrases measured by distinct incident prevalence."
+  )
+```
+
+The exploratory text results help reveal recurring themes, but safeguards should not be based simply on the frequency of individual words.
+
+## Report-Level Text Specificity and Risk Mentions
+
+As an additional exploratory step, report text is examined using TF-IDF and a selected set of AI and risk-related terms. TF-IDF highlights words that are unusually important within individual incidents, while the term analysis shows how often selected concepts appear across source reports.
+
+These results are treated as supporting evidence rather than the main estimate of risk prevalence. Multiple reports can describe the same incident, so report-level mention counts can give highly publicised incidents more influence than incidents with fewer source articles.
+
+### Prepare and Clean Report Text
+
+```{r}
+#| label: teammate-prepare-report-text
+#| include: false
+
+analysis_data <- reports_incidents_joined |>
+  filter(
+    !is.na(incident_id),
+    !is.na(report_number),
+    !is.na(plain_text),
+    str_trim(plain_text) != ""
+  ) |>
+  transmute(
+    incident_id,
+    report_number,
+    report_title,
+    report_plain_text = plain_text,
+    report_source = source_domain
+  ) |>
+  mutate(
+    report_plain_text = replace_na(
+      report_plain_text,
+      ""
+    ),
+    text_clean = report_plain_text |>
+      textclean::replace_contraction() |>
+      textclean::replace_url() |>
+      textclean::replace_html() |>
+      str_squish(),
+    word_count = str_count(
+      text_clean,
+      "\\S+"
+    )
+  )
+```
+
+```{r}
+#| label: teammate-word-count-summary
+
+report_word_count_summary <- analysis_data |>
+  summarise(
+    Reports = n_distinct(report_number),
+    `Median words` = round(
+      median(word_count),
+      0
+    ),
+    `Mean words` = round(
+      mean(word_count),
+      0
+    ),
+    `Maximum words` = max(word_count)
+  )
+
+knitr::kable(
+  report_word_count_summary,
+  caption = "Word-count summary for linked reports with usable text."
+)
+```
+
+The word-count check indicates how much source text is available for later token-based analysis and whether unusually long reports could dominate simple raw word frequencies.
+
+### TF-IDF at Incident Level
+
+TF-IDF measures how distinctive a word is to an incident relative to the broader incident corpus.
+
+```{r}
+#| label: teammate-tfidf
+#| include: false
+
+teammate_stop_words <- tibble(
+  word = c(
+    "people",
+    "company",
+    "companies",
+    "time",
+    "including",
+    "told",
+    "technology",
+    "technologies",
+    "artificial",
+    "intelligence",
+    "report",
+    "reports",
+    "media",
+    "system",
+    "systems"
+  )
+)
+
+incident_text_tfidf <- analysis_data |>
+  group_by(incident_id) |>
+  summarise(
+    text_clean = str_c(
+      text_clean,
+      collapse = " "
+    ),
+    .groups = "drop"
+  )
+
+incident_tfidf <- incident_text_tfidf |>
+  unnest_tokens(
+    word,
+    text_clean
+  ) |>
+  anti_join(
+    stop_words,
+    by = "word"
+  ) |>
+  anti_join(
+    teammate_stop_words,
+    by = "word"
+  ) |>
+  filter(
+    str_detect(
+      word,
+      "^[a-z]+$"
+    ),
+    str_length(word) >= 3
+  ) |>
+  count(
+    incident_id,
+    word,
+    sort = TRUE
+  ) |>
+  bind_tf_idf(
+    term = word,
+    document = incident_id,
+    n = n
+  )
+
+top_tfidf_words <- incident_tfidf |>
+  arrange(desc(tf_idf)) |>
+  slice_head(n = 20) |>
+  mutate(
+    label = str_c(
+      word,
+      " · incident ",
+      incident_id
+    ),
+    hover_text = str_c(
+      "<b>",
+      word,
+      "</b>",
+      "<br>Incident: ",
+      incident_id,
+      "<br>Occurrences: ",
+      n,
+      "<br>TF-IDF: ",
+      round(tf_idf, 4)
+    ),
+    label = forcats::fct_reorder(
+      label,
+      tf_idf
+    )
+  )
+```
+
+```{r}
+#| label: fig-top-tfidf
+#| fig-cap: "Highest TF-IDF word-incident combinations in the linked report corpus."
+
+tfidf_plot <- top_tfidf_words |>
+  ggplot(
+    aes(
+      x = label,
+      y = tf_idf,
+      fill = word,
+      text = hover_text
+    )
+  ) +
+  geom_col(
+    show.legend = FALSE
+  ) +
+  coord_flip() +
+  scale_fill_viridis_d(
+    option = "C",
+    end = 0.9
+  ) +
+  labs(
+    x = NULL,
+    y = "TF-IDF"
+  ) +
+  theme_minimal()
+
+show_interactive(
+  tfidf_plot,
+  tooltip = "text"
+)
+```
+
+TF-IDF is not a direct measure of risk. It is used here to identify language that is unusually characteristic of particular incidents and to complement the broader prevalence analysis.
+
+### Selected AI and Risk-Related Terms
+
+The following exploratory dictionary tracks terms identified during the team's text analysis. It contains both general AI terminology and risk-related concepts, so these terms are treated as descriptive text indicators rather than formal incident classifications.
+
+```{r}
+#| label: teammate-risk-dictionary
+#| include: false
+
+risk_categories <- tribble(
+  ~risk, ~pattern,
+  "AI", "\\bai\\b|artificial intelligence",
+  "Privacy", "\\bprivacy\\b",
+  "Detection", "\\bdetection\\b",
+  "False information", "false information|misinformation",
+  "Data leak", "data leak|data leakage",
+  "Harassment", "\\bharassment\\b",
+  "Chatbot", "\\bchatbot\\b|\\bchatbots\\b",
+  "Recognition", "\\brecognition\\b",
+  "Biometric", "\\bbiometric\\b|\\bbiometrics\\b",
+  "Biased data", "biased data|data bias",
+  "Confidential", "\\bconfidential\\b",
+  "Generative AI", "generative ai|generative artificial intelligence",
+  "Agentic AI", "agentic ai"
+)
+```
+
+Rather than counting overlapping four-word n-grams, each dictionary pattern is counted directly in the cleaned report text. This avoids multiplying one occurrence across several overlapping text windows.
+
+```{r}
+#| label: teammate-risk-mentions
+#| include: false
+
+risk_mentions_by_report <- map2_dfr(
+  risk_categories$risk,
+  risk_categories$pattern,
+  \(risk_name, risk_pattern) {
+    analysis_data |>
+      transmute(
+        report_number,
+        incident_id,
+        risk = risk_name,
+        mentions = str_count(
+          str_to_lower(text_clean),
+          regex(
+            risk_pattern,
+            ignore_case = TRUE
+          )
+        )
+      )
+  }
+)
+
+risk_mentions_summary <- risk_mentions_by_report |>
+  group_by(risk) |>
+  summarise(
+    reports_with_term = n_distinct(
+      report_number[mentions > 0]
+    ),
+    incidents_with_term = n_distinct(
+      incident_id[mentions > 0]
+    ),
+    total_mentions = sum(mentions),
+    .groups = "drop"
+  ) |>
+  arrange(
+    desc(incidents_with_term)
+  ) |>
+  mutate(
+    hover_text = str_c(
+      "<b>",
+      risk,
+      "</b>",
+      "<br>Incidents containing term: ",
+      scales::comma(incidents_with_term),
+      "<br>Reports containing term: ",
+      scales::comma(reports_with_term),
+      "<br>Total text mentions: ",
+      scales::comma(total_mentions)
+    )
+  )
+```
+
+```{r}
+#| label: teammate-risk-mentions-table
+
+risk_mentions_summary |>
+  select(
+    risk,
+    incidents_with_term,
+    reports_with_term,
+    total_mentions
+  ) |>
+  rename(
+    `Selected term` = risk,
+    `Distinct incidents` = incidents_with_term,
+    `Distinct reports` = reports_with_term,
+    `Total mentions` = total_mentions
+  ) |>
+  knitr::kable(
+    caption = "Occurrence of selected AI and risk-related terminology in linked report text."
+  )
+```
+
+```{r}
+#| label: fig-selected-risk-terms
+#| fig-cap: "Distinct incidents containing selected AI and risk-related terminology."
+
+risk_term_plot <- risk_mentions_summary |>
+  mutate(
+    risk = forcats::fct_reorder(
+      risk,
+      incidents_with_term
+    )
+  ) |>
+  ggplot(
+    aes(
+      x = risk,
+      y = incidents_with_term,
+      fill = risk,
+      text = hover_text
+    )
+  ) +
+  geom_col(
+    show.legend = FALSE
+  ) +
+  coord_flip() +
+  scale_fill_viridis_d(
+    option = "D",
+    end = 0.9
+  ) +
+  labs(
+    x = NULL,
+    y = "Distinct incidents containing term"
+  ) +
+  theme_minimal()
+
+show_interactive(
+  risk_term_plot,
+  tooltip = "text"
+)
+```
+
+The incident count is emphasised because it is less sensitive to uneven media coverage than raw report mentions. The table and interactive hover information retain the report-level counts for context.
+
+### Distribution of Mentions Within Reports
+
+The next figure shows how frequently selected terms are repeated within reports that contain them at least once.
+
+```{r}
+#| label: fig-risk-mention-distribution
+#| fig-cap: "Distribution of selected term mentions among reports containing each term."
+
+risk_distribution_data <- risk_mentions_by_report |>
+  filter(
+    mentions > 0
+  ) |>
+  left_join(
+    risk_mentions_summary |>
+      select(
+        risk,
+        incidents_with_term
+      ),
+    by = "risk"
+  ) |>
+  mutate(
+    risk = forcats::fct_reorder(
+      risk,
+      incidents_with_term
+    ),
+    hover_text = str_c(
+      "<b>",
+      risk,
+      "</b>",
+      "<br>Report: ",
+      report_number,
+      "<br>Mentions in report: ",
+      mentions
+    )
+  )
+
+risk_distribution_plot <- risk_distribution_data |>
+  ggplot(
+    aes(
+      x = risk,
+      y = mentions,
+      fill = risk,
+      text = hover_text
+    )
+  ) +
+  geom_boxplot(
+    alpha = 0.75,
+    outlier.alpha = 0.35,
+    show.legend = FALSE
+  ) +
+  coord_flip() +
+  scale_fill_viridis_d(
+    option = "B",
+    end = 0.9
+  ) +
+  labs(
+    x = NULL,
+    y = "Mentions per report containing the term"
+  ) +
+  theme_minimal()
+
+show_interactive(
+  risk_distribution_plot,
+  tooltip = "text"
+)
+```
+
+This distribution is descriptive rather than a prevalence estimate. Repetition within one article does not imply that the associated risk is more common across AI incidents.
+
+The exploratory text analysis helps reveal recurring themes, but the main risk estimates below are based on **distinct incidents** rather than raw report frequencies.
+
+# Generative AI Failure Patterns
+
+The central analysis classifies each identified GenAI incident against a set of recurring failure patterns.
+
+The categories are not official AIID labels. They are transparent text-based indicators designed to measure whether the incident evidence contains language associated with a particular type of failure.
+
+An incident can belong to more than one category.
+
+## Classify Failure Patterns
+
+```{r}
+#| label: classify-genai-risks
+
+genai_risks <- genai_incidents |>
+  mutate(
+
+    inaccurate_output =
+      str_detect(
+        analysis_text,
+        regex(
+          paste(
+            c(
+              "hallucinat",
+              "fabricat",
+              "made up",
+              "false information",
+              "incorrect information",
+              "inaccurate information",
+              "false claim",
+              "wrong answer",
+              "incorrect answer",
+              "misinformation",
+              "invented",
+              "nonexistent"
+            ),
+            collapse = "|"
+          ),
+          ignore_case = TRUE
+        )
+      ),
+
+    unsafe_advice =
+      str_detect(
+        analysis_text,
+        regex(
+          paste(
+            c(
+              "harmful advice",
+              "unsafe advice",
+              "dangerous advice",
+              "unsafe recommendation",
+              "harmful recommendation",
+              "self-harm",
+              "suicide advice",
+              "medical advice",
+              "legal advice"
+            ),
+            collapse = "|"
+          ),
+          ignore_case = TRUE
+        )
+      ),
+
+    privacy_data =
+      str_detect(
+        analysis_text,
+        regex(
+          paste(
+            c(
+              "privacy",
+              "personal data",
+              "personal information",
+              "confidential information",
+              "confidential data",
+              "sensitive information",
+              "sensitive data",
+              "data leak",
+              "data breach",
+              "exposed data",
+              "training data"
+            ),
+            collapse = "|"
+          ),
+          ignore_case = TRUE
+        )
+      ),
+
+    bias_discrimination =
+      str_detect(
+        analysis_text,
+        regex(
+          paste(
+            c(
+              "\\bbias\\b",
+              "\\bbiased\\b",
+              "discriminat",
+              "racial bias",
+              "gender bias",
+              "stereotyp",
+              "unequal treatment",
+              "unfair treatment"
+            ),
+            collapse = "|"
+          ),
+          ignore_case = TRUE
+        )
+      ),
+
+    fraud_impersonation =
+      str_detect(
+        analysis_text,
+        regex(
+          paste(
+            c(
+              "\\bfraud\\b",
+              "\\bscam\\b",
+              "\\bscams\\b",
+              "impersonat",
+              "deepfake",
+              "phishing",
+              "identity theft",
+              "fake voice",
+              "fake image",
+              "fake video",
+              "deceptive content"
+            ),
+            collapse = "|"
+          ),
+          ignore_case = TRUE
+        )
+      ),
+
+    automation_oversight =
+      str_detect(
+        analysis_text,
+        regex(
+          paste(
+            c(
+              "automated decision",
+              "automatic decision",
+              "without human",
+              "human oversight",
+              "human review",
+              "lack of oversight",
+              "no oversight",
+              "autonomous decision",
+              "automated action"
+            ),
+            collapse = "|"
+          ),
+          ignore_case = TRUE
+        )
+      ),
+
+    security_misuse =
+      str_detect(
+        analysis_text,
+        regex(
+          paste(
+            c(
+              "prompt injection",
+              "jailbreak",
+              "jailbreaking",
+              "security vulnerability",
+              "cybersecurity",
+              "\\bmalware\\b",
+              "\\bhack",
+              "unauthorised access",
+              "unauthorized access",
+              "security flaw",
+              "security breach"
+            ),
+            collapse = "|"
+          ),
+          ignore_case = TRUE
+        )
+      )
+  )
+```
+
+## Question 2: How Common Are the Failure Patterns Across Distinct Incidents?
+
+```{r}
+#| label: risk-prevalence
+
+risk_prevalence <- genai_risks |>
+  summarise(
+    `Incorrect or fabricated output` =
+      sum(
+        inaccurate_output,
+        na.rm = TRUE
+      ),
+
+    `Unsafe or harmful advice` =
+      sum(
+        unsafe_advice,
+        na.rm = TRUE
+      ),
+
+    `Privacy or confidential-data risk` =
+      sum(
+        privacy_data,
+        na.rm = TRUE
+      ),
+
+    `Bias or discrimination` =
+      sum(
+        bias_discrimination,
+        na.rm = TRUE
+      ),
+
+    `Fraud or impersonation` =
+      sum(
+        fraud_impersonation,
+        na.rm = TRUE
+      ),
+
+    `Automation or oversight failure` =
+      sum(
+        automation_oversight,
+        na.rm = TRUE
+      ),
+
+    `Security or misuse` =
+      sum(
+        security_misuse,
+        na.rm = TRUE
+      )
+  ) |>
+  pivot_longer(
+    everything(),
+    names_to = "risk",
+    values_to = "n_incidents"
+  ) |>
+  mutate(
+    pct_incidents =
+      ifelse(
+        n_genai_incidents > 0,
+        100 *
+          n_incidents /
+          n_genai_incidents,
+        NA_real_
+      )
+  ) |>
+  arrange(
+    desc(n_incidents)
+  )
+```
+
+```{r}
+#| label: risk-prevalence-table
+
+risk_prevalence |>
+  rename(
+    `Failure pattern` = risk,
+    Incidents = n_incidents,
+    `GenAI incidents (%)` =
+      pct_incidents
+  ) |>
+  mutate(
+    `GenAI incidents (%)` =
+      round(
+        `GenAI incidents (%)`,
+        1
+      )
+  ) |>
+  knitr::kable(
+    caption = "Prevalence of selected failure-pattern indicators across identified GenAI incidents."
+  )
+```
+
+```{r}
+#| label: fig-risk-prevalence
+#| fig-cap: "Prevalence of selected failure-pattern indicators across identified generative AI incidents."
+
+risk_prevalence_plot <- risk_prevalence |>
+  mutate(
+    risk = forcats::fct_reorder(
+      risk,
+      n_incidents
+    ),
+    hover_text = str_c(
+      "<b>",
+      risk,
+      "</b>",
+      "<br>Incidents: ",
+      scales::comma(n_incidents)
+    )
+  ) |>
+  ggplot(
+    aes(
+      x = risk,
+      y = n_incidents,
+      fill = risk,
+      text = hover_text
+    )
+  ) +
+  geom_col(
+    show.legend = FALSE
+  ) +
+  coord_flip() +
+  scale_fill_viridis_d(
+    option = "C",
+    end = 0.9
+  ) +
+  labs(
+    x = NULL,
+    y = "Number of identified GenAI incidents"
+  ) +
+  theme_minimal()
+
+show_interactive(
+  risk_prevalence_plot,
+  tooltip = "text"
+)
+```
+
+The table and figure provide the main quantitative answer to Question 2: **how common the selected failure patterns are across distinct identified generative AI incidents**.
+
+The absolute numbers describe the share of screened incidents containing evidence matching each indicator. They do not represent the probability that a future SEC Victoria deployment will experience that failure.
+
+## Number of Failure Patterns per Incident
+
+An incident may contain several risks at once. This matters because operational failures are often not caused by a single isolated weakness.
+
+```{r}
+#| label: multi-risk-incidents
+
+genai_risks <- genai_risks |>
+  mutate(
+    n_failure_patterns =
+      rowSums(
+        across(
+          c(
+            inaccurate_output,
+            unsafe_advice,
+            privacy_data,
+            bias_discrimination,
+            fraud_impersonation,
+            automation_oversight,
+            security_misuse
+          )
+        ),
+        na.rm = TRUE
+      )
+  )
+
+multi_risk_summary <- genai_risks |>
+  count(
+    n_failure_patterns,
+    name = "n_incidents"
+  ) |>
+  mutate(
+    pct_incidents =
+      100 *
+      n_incidents /
+      sum(n_incidents)
+  )
+
+knitr::kable(
+  multi_risk_summary |>
+    rename(
+      `Failure patterns identified` =
+        n_failure_patterns,
+      Incidents = n_incidents,
+      `GenAI incidents (%)` =
+        pct_incidents
+    ) |>
+    mutate(
+      `GenAI incidents (%)` =
+        round(
+          `GenAI incidents (%)`,
+          1
+        )
+    ),
+  caption = "Number of selected failure patterns identified within each GenAI incident."
+)
+```
+
+```{r}
+#| label: fig-multi-risk
+#| fig-cap: "Number of selected failure-pattern indicators identified within each generative AI incident."
+
+multi_risk_plot <- multi_risk_summary |>
+  mutate(
+    failure_patterns = factor(
+      n_failure_patterns
+    ),
+    hover_text = str_c(
+      "<b>",
+      n_failure_patterns,
+      " failure pattern",
+      if_else(n_failure_patterns == 1, "", "s"),
+      "</b>",
+      "<br>Incidents: ",
+      scales::comma(n_incidents),
+      "<br>Share of screened GenAI incidents: ",
+      round(pct_incidents, 1),
+      "%"
+    )
+  ) |>
+  ggplot(
+    aes(
+      x = failure_patterns,
+      y = pct_incidents,
+      fill = pct_incidents,
+      text = hover_text
+    )
+  ) +
+  geom_col() +
+  scale_fill_viridis_c(
+    option = "D",
+    guide = "none"
+  ) +
+  labs(
+    x = "Number of failure patterns identified",
+    y = "Percentage of identified GenAI incidents"
+  ) +
+  theme_minimal()
+
+show_interactive(
+  multi_risk_plot,
+  tooltip = "text"
+)
+```
+
+This provides evidence for using **layered safeguards** rather than assuming a single control will address every failure mechanism.
+
+# Root-Cause and Control-Gap Patterns
+
+The incident text can also be used to identify recurring control gaps associated with failures.
+
+These indicators should be interpreted as **observable patterns or proxies**, not definitive causal findings. Incident reports do not provide a controlled experiment capable of proving causation.
+
+## Classify Control-Gap Indicators
+
+```{r}
+#| label: classify-control-gaps
+
+genai_control_gaps <- genai_risks |>
+  mutate(
+
+    verification_gap =
+      str_detect(
+        analysis_text,
+        regex(
+          paste(
+            c(
+              "hallucinat",
+              "fabricat",
+              "false information",
+              "incorrect information",
+              "inaccurate information",
+              "wrong answer",
+              "failed to verify",
+              "not verified",
+              "unverified"
+            ),
+            collapse = "|"
+          ),
+          ignore_case = TRUE
+        )
+      ),
+
+    human_oversight_gap =
+      str_detect(
+        analysis_text,
+        regex(
+          paste(
+            c(
+              "without human",
+              "lack of human",
+              "human oversight",
+              "lack of oversight",
+              "no oversight",
+              "human review",
+              "automated decision",
+              "autonomous decision"
+            ),
+            collapse = "|"
+          ),
+          ignore_case = TRUE
+        )
+      ),
+
+    data_governance_gap =
+      str_detect(
+        analysis_text,
+        regex(
+          paste(
+            c(
+              "privacy",
+              "personal data",
+              "personal information",
+              "confidential data",
+              "sensitive data",
+              "data leak",
+              "data breach",
+              "training data"
+            ),
+            collapse = "|"
+          ),
+          ignore_case = TRUE
+        )
+      ),
+
+    security_control_gap =
+      str_detect(
+        analysis_text,
+        regex(
+          paste(
+            c(
+              "prompt injection",
+              "jailbreak",
+              "security vulnerability",
+              "security flaw",
+              "unauthorised access",
+              "unauthorized access",
+              "cybersecurity"
+            ),
+            collapse = "|"
+          ),
+          ignore_case = TRUE
+        )
+      ),
+
+    fairness_governance_gap =
+      str_detect(
+        analysis_text,
+        regex(
+          paste(
+            c(
+              "\\bbias\\b",
+              "\\bbiased\\b",
+              "discriminat",
+              "stereotyp",
+              "unequal treatment",
+              "unfair treatment"
+            ),
+            collapse = "|"
+          ),
+          ignore_case = TRUE
+        )
+      ),
+
+    misuse_abuse =
+      str_detect(
+        analysis_text,
+        regex(
+          paste(
+            c(
+              "\\bfraud\\b",
+              "\\bscam\\b",
+              "impersonat",
+              "deepfake",
+              "phishing",
+              "malicious use",
+              "misuse"
+            ),
+            collapse = "|"
+          ),
+          ignore_case = TRUE
+        )
+      )
+  )
+```
+
+## Quantify Control Gaps
+
+```{r}
+#| label: control-gap-prevalence
+
+control_gap_prevalence <- genai_control_gaps |>
+  summarise(
+    `Verification or grounding gap` =
+      sum(
+        verification_gap,
+        na.rm = TRUE
+      ),
+
+    `Human oversight gap` =
+      sum(
+        human_oversight_gap,
+        na.rm = TRUE
+      ),
+
+    `Data-governance gap` =
+      sum(
+        data_governance_gap,
+        na.rm = TRUE
+      ),
+
+    `Security-control gap` =
+      sum(
+        security_control_gap,
+        na.rm = TRUE
+      ),
+
+    `Fairness-governance gap` =
+      sum(
+        fairness_governance_gap,
+        na.rm = TRUE
+      ),
+
+    `Misuse or abuse` =
+      sum(
+        misuse_abuse,
+        na.rm = TRUE
+      )
+  ) |>
+  pivot_longer(
+    everything(),
+    names_to = "control_gap",
+    values_to = "n_incidents"
+  ) |>
+  arrange(
+    desc(n_incidents)
+  )
+```
+
+```{r}
+#| label: fig-control-gap-prevalence
+#| fig-cap: "Number of identified generative AI incidents containing each selected control-gap indicator."
+
+control_gap_plot <- control_gap_prevalence |>
+  mutate(
+    control_gap = forcats::fct_reorder(
+      control_gap,
+      n_incidents
+    ),
+    hover_text = str_c(
+      "<b>",
+      control_gap,
+      "</b>",
+      "<br>Incidents: ",
+      scales::comma(n_incidents)
+    )
+  ) |>
+  ggplot(
+    aes(
+      x = control_gap,
+      y = n_incidents,
+      fill = control_gap,
+      text = hover_text
+    )
+  ) +
+  geom_col(
+    show.legend = FALSE
+  ) +
+  coord_flip() +
+  scale_fill_viridis_d(
+    option = "B",
+    end = 0.9
+  ) +
+  labs(
+    x = NULL,
+    y = "Number of identified GenAI incidents"
+  ) +
+  theme_minimal()
+
+show_interactive(
+  control_gap_plot,
+  tooltip = "text"
+)
+```
+
+These results help move the analysis from describing **what went wrong** to identifying **which controls should receive the greatest attention** in an internal SEC Victoria rollout.
+
+# Question 3: Implications for SEC Victoria
+
+The AIID data do not contain SEC Victoria deployments. The relevance assessment therefore combines the quantified incident patterns with the three operational areas specified in the challenge brief.
+
+The statistical evidence comes from AIID; the operational mapping is an interpretation of how the same failure mechanism could affect SEC Victoria.
+
+## Retail Operations
+
+Internal generative AI could support staff responding to customer enquiries, summarising account information, explaining products or tariffs, drafting communications, or handling internal knowledge queries.
+
+The incident evidence suggests that the most relevant controls are those addressing inaccurate outputs, confidential information, unfair treatment and unchecked reliance on generated recommendations.
+
+```{r}
+#| label: sec-retail-map
+
+sec_retail_map <- tibble(
+  `AIID failure pattern` = c(
+    "Incorrect or fabricated output",
+    "Privacy or confidential-data risk",
+    "Bias or discrimination",
+    "Automation or oversight failure"
+  ),
+  `Potential SEC retail consequence` = c(
+    "Incorrect tariff, account, product or customer-service information",
+    "Customer or account information exposed through prompts or generated outputs",
+    "Unequal or inappropriate responses across different customer groups",
+    "Staff acting on generated information without sufficient verification"
+  )
+)
+
+knitr::kable(
+  sec_retail_map,
+  caption = "How recurring GenAI failure patterns could translate to SEC Victoria retail operations."
+)
+```
+
+## Wholesale Operations
+
+Wholesale activities can involve commercially sensitive information and higher-consequence analytical decisions.
+
+Generative AI used for summarisation, market intelligence, internal analysis or decision support should therefore be treated differently from low-consequence drafting tasks.
+
+```{r}
+#| label: sec-wholesale-map
+
+sec_wholesale_map <- tibble(
+  `AIID failure pattern` = c(
+    "Incorrect or fabricated output",
+    "Privacy or confidential-data risk",
+    "Security or misuse",
+    "Automation or oversight failure"
+  ),
+  `Potential SEC wholesale consequence` = c(
+    "Incorrect summaries, unsupported market claims or analytical assumptions",
+    "Exposure of commercially sensitive information",
+    "Prompt injection, malicious content or inappropriate access to internal information",
+    "Generated analysis influencing consequential decisions without independent validation"
+  )
+)
+
+knitr::kable(
+  sec_wholesale_map,
+  caption = "How recurring GenAI failure patterns could translate to SEC Victoria wholesale operations."
+)
+```
+
+## Household Electrification
+
+Generative AI could also assist internal teams supporting households considering electrification, such as solar, batteries, electric appliances or other energy upgrades.
+
+The key risk is that generated guidance can sound authoritative even when it is incomplete, unsupported or unsuitable for a particular household.
+
+```{r}
+#| label: sec-electrification-map
+
+sec_electrification_map <- tibble(
+  `AIID failure pattern` = c(
+    "Incorrect or fabricated output",
+    "Unsafe or harmful advice",
+    "Privacy or confidential-data risk",
+    "Bias or discrimination"
+  ),
+  `Potential household-electrification consequence` = c(
+    "Incorrect information about technologies, eligibility, costs or installation considerations",
+    "Recommendations that are unsuitable or potentially unsafe without qualified assessment",
+    "Household, property or customer information disclosed inappropriately",
+    "Different households receiving systematically different quality of guidance"
+  )
+)
+
+knitr::kable(
+  sec_electrification_map,
+  caption = "How recurring GenAI failure patterns could translate to household-electrification support."
+)
+```
+
+# Question 4: Recommended Safeguards
+
+The safeguards below are designed to respond directly to the failure patterns measured in the AIID analysis.
+
+They should be implemented proportionately: low-risk drafting tasks do not require the same controls as tools that influence customer outcomes, commercially sensitive analysis or household energy recommendations.
+
+```{r}
+#| label: safeguard-evidence
+#| include: false
+
+sec_safeguards <- risk_prevalence |>
+  mutate(
+
+    safeguard = case_when(
+
+      risk ==
+        "Incorrect or fabricated output" ~
+        paste(
+          "Ground answers in approved SEC information sources,",
+          "show source references where practical,",
+          "and require independent verification for consequential outputs."
+        ),
+
+      risk ==
+        "Unsafe or harmful advice" ~
+        paste(
+          "Define prohibited advice categories and escalation rules.",
+          "Require qualified human review before technical, safety-sensitive",
+          "or household-specific recommendations are acted upon."
+        ),
+
+      risk ==
+        "Privacy or confidential-data risk" ~
+        paste(
+          "Apply data classification, role-based access controls,",
+          "approved-model restrictions and prompt/output logging.",
+          "Prevent sensitive customer or commercial information",
+          "from entering unapproved models."
+        ),
+
+      risk ==
+        "Bias or discrimination" ~
+        paste(
+          "Test outputs across relevant customer groups,",
+          "monitor for materially different treatment,",
+          "and establish a process for reviewing disputed or harmful outputs."
+        ),
+
+      risk ==
+        "Fraud or impersonation" ~
+        paste(
+          "Restrict automated external communications,",
+          "verify identity and provenance for generated content,",
+          "and clearly distinguish AI-generated material where appropriate."
+        ),
+
+      risk ==
+        "Automation or oversight failure" ~
+        paste(
+          "Keep high-consequence uses advisory-only by default.",
+          "Require explicit human approval before generated outputs",
+          "trigger customer, commercial or operational actions."
+        ),
+
+      risk ==
+        "Security or misuse" ~
+        paste(
+          "Use access controls, prompt-injection testing,",
+          "logging and monitoring, and isolate GenAI systems",
+          "from direct control of critical operational infrastructure."
+        ),
+
+      TRUE ~
+        "Apply risk-based monitoring and human review."
+    ),
+
+    sec_application = case_when(
+
+      risk ==
+        "Incorrect or fabricated output" ~
+        "Retail, wholesale and household electrification",
+
+      risk ==
+        "Unsafe or harmful advice" ~
+        "Household electrification and customer support",
+
+      risk ==
+        "Privacy or confidential-data risk" ~
+        "Retail, wholesale and household electrification",
+
+      risk ==
+        "Bias or discrimination" ~
+        "Retail and household electrification",
+
+      risk ==
+        "Fraud or impersonation" ~
+        "Retail communications and internal security",
+
+      risk ==
+        "Automation or oversight failure" ~
+        "Retail, wholesale and household electrification",
+
+      risk ==
+        "Security or misuse" ~
+        "Wholesale and internal systems",
+
+      TRUE ~
+        "All uses"
+    )
+  )
+```
+
+```{r}
+#| label: safeguard-table
+
+sec_safeguards |>
+  transmute(
+    `AIID finding` =
+      risk,
+
+    `Incidents` =
+      n_incidents,
+
+    `GenAI incidents (%)` =
+      round(
+        pct_incidents,
+        1
+      ),
+
+    `SEC relevance` =
+      sec_application,
+
+    `Recommended safeguard` =
+      safeguard
+  ) |>
+  knitr::kable(
+    caption = "Recommended safeguards linked to quantified AIID failure-pattern indicators."
+  )
+```
+
+## Recommended Rollout Model
+
+The incident evidence supports a **risk-tiered rollout** rather than treating every GenAI use case as equally safe.
+
+### Tier 1: Low-consequence assistance
+
+Examples include:
+
+- drafting internal text;
+- summarising non-sensitive documents;
+- brainstorming;
+- formatting content.
+
+These uses can operate with lighter controls, although staff should still verify generated content.
+
+### Tier 2: Customer or analytical decision support
+
+Examples include:
+
+- customer-service assistance;
+- tariff or product explanations;
+- household-electrification guidance;
+- market or commercial analysis.
+
+These uses should require approved information sources, monitoring, clear source attribution where practical and human review before consequential information is relied upon.
+
+### Tier 3: High-consequence or operational actions
+
+Examples include:
+
+- automated customer decisions;
+- actions involving commercially sensitive information;
+- safety-sensitive recommendations;
+- direct interaction with critical operational systems.
+
+The incident patterns support keeping generative AI **advisory rather than autonomous** in these applications unless the system has undergone substantially stronger validation, governance and assurance.
+
+# Key Findings
+
+The analysis provides four main findings for SEC Victoria.
+
+First, AI incident reporting is highly uneven. Some incidents receive many more reports than others, meaning raw report counts can exaggerate the apparent importance of highly publicised events. The main risk analysis therefore uses distinct incidents as its unit of analysis.
+
+Second, the identified generative AI incidents contain multiple recurring failure patterns rather than one dominant technical problem. These include incorrect or fabricated outputs, privacy and data issues, unsafe advice, unfair outcomes, misuse and insufficient oversight.
+
+Third, several incidents contain more than one selected failure pattern. This supports a layered-control approach in which verification, human oversight, data governance and security operate together rather than as isolated safeguards.
+
+Finally, the implications differ across SEC Victoria's operations. Customer-facing and household-support tasks create greater risks from incorrect advice, privacy failures and unequal treatment, while wholesale and internal analytical uses place greater emphasis on verification, commercially sensitive information, security and human approval for consequential decisions.
+
+# Limitations and Ethical Considerations
+
+The results should be interpreted as evidence about **patterns in reported historical incidents**, not as a forecast of the probability that SEC Victoria will experience a particular failure.
+
+AIID is an incident database rather than a random sample of all deployed AI systems. Events that receive media, regulatory or public attention may be more likely to appear in the database. Consequently, the prevalence values in this report describe the selected incident corpus rather than population-wide failure rates.
+
+The generative AI screen is based on identifiable terminology and system names. It may miss incidents where a generative model is not clearly described.
+
+The failure-pattern and control-gap classifications are also based on transparent keyword and phrase indicators. They support reproducible pattern analysis, but they should not be interpreted as definitive causal labels.
+
+Reports in multiple languages are retained. However, the current token cleaning, custom stop words and risk dictionaries are mainly English-focused. Multilingual incidents may therefore be classified less completely.
+
+Some incident categories overlap. An incident involving a privacy failure can also involve weak oversight, misuse or security weaknesses. Percentages across categories therefore should not be summed to 100%.
+
+Publication dates identify when source reports were published and may differ from the date on which an incident occurred.
+
+Despite these limitations, the incident-level approach provides a defensible way to use historical evidence to identify controls that SEC Victoria should prioritise before deploying internal generative AI into higher-consequence workflows.
+
+# Conclusion
+
+The AI Incident Database suggests that the main challenge for SEC Victoria is not simply whether generative AI can produce useful outputs, but whether those outputs can be trusted and governed when they interact with customers, commercially sensitive information and household energy decisions.
+
+The recurring incident patterns support four broad priorities: verify generated information against trusted SEC sources, retain meaningful human oversight, restrict the use of sensitive information, and apply stronger controls as the consequence of an AI-assisted decision increases.
+
+For SEC Victoria, this means generative AI is best introduced through a risk-tiered model. Low-consequence internal assistance can be adopted with relatively light controls, while retail advice, wholesale analysis and household-electrification recommendations should require stronger verification and oversight. Generative AI should not directly control high-consequence operational actions unless substantially stronger assurance has been demonstrated.

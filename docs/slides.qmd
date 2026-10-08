@@ -1,0 +1,795 @@
+---
+title: "Generative AI Risks and Safeguards for SEC Victoria"
+subtitle: "Evidence from the AI Incident Database"
+author: "Datathon Team"
+format:
+  revealjs:
+    theme: simple
+    slide-number: true
+    progress: true
+    transition: fade
+    center: false
+    slide-level: 2
+    incremental: false
+    width: 1600
+    height: 900
+execute:
+  echo: false
+  warning: false
+  message: false
+editor: visual
+---
+
+```{=html}
+<style>
+.reveal { font-size: 30px; }
+.reveal h1 { font-size: 1.7em; }
+.reveal h2 { font-size: 1.35em; margin-bottom: 0.35em; }
+.reveal h3 { font-size: 0.95em; margin-bottom: 0.25em; }
+.reveal h4 { font-size: 0.78em; margin-top: 0.1em; }
+.reveal p, .reveal li { font-size: 0.72em; line-height: 1.22; }
+.reveal ul, .reveal ol { margin-top: 0.3em; }
+.reveal strong { font-weight: 700; }
+.reveal .columns { gap: 1.2em; align-items: flex-start; }
+.reveal table { font-size: 0.52em; line-height: 1.15; }
+.reveal .cell-output-display { margin-top: 0.1em; }
+.reveal .slide-number { font-size: 0.45em; }
+.reveal .subtitle { font-size: 0.7em; }
+.reveal .quarto-title-author { font-size: 0.55em; }
+.reveal img, .reveal svg { max-height: 560px; }
+.small-note { font-size: 0.55em; line-height: 1.15; }
+.metric-card { font-size: 1.15em; line-height: 1.55; }
+.metric-card strong { font-size: 1.7em; }
+</style>
+```
+
+```{r}
+#| label: setup
+#| include: false
+
+library(mongolite)
+library(tidyverse)
+library(tidytext)
+library(janitor)
+library(lubridate)
+library(here)
+library(jsonlite)
+
+analysis_end <- as.Date("2026-09-21")
+
+db_name <- "aiidprod"
+
+reports_conn <- mongo(
+  collection = "reports",
+  db = db_name,
+  url = Sys.getenv("MONGO_URI")
+)
+
+incidents_conn <- mongo(
+  collection = "incidents",
+  db = db_name,
+  url = Sys.getenv("MONGO_URI")
+)
+
+n_reports <- reports_conn$count()
+n_incidents <- incidents_conn$count()
+```
+
+```{r}
+#| label: build-analysis-data
+#| include: false
+
+reports_incidents_joined <- reports_conn$aggregate('[
+  {
+    "$lookup": {
+      "from": "incidents",
+      "localField": "report_number",
+      "foreignField": "reports",
+      "as": "incident"
+    }
+  },
+  {
+    "$unwind": {
+      "path": "$incident",
+      "preserveNullAndEmptyArrays": true
+    }
+  },
+  {
+    "$project": {
+      "_id": 0,
+      "report_number": 1,
+      "plain_text": 1,
+      "language": 1,
+      "incident_id": "$incident.incident_id",
+      "incident_title": "$incident.title",
+      "incident_description": "$incident.description",
+      "incident_date": "$incident.date"
+    }
+  }
+]') |>
+  as_tibble()
+
+reports_per_incident <- incidents_conn$aggregate('[
+  {
+    "$project": {
+      "_id": 0,
+      "incident_id": 1,
+      "n_reports": {
+        "$size": {
+          "$ifNull": ["$reports", []]
+        }
+      }
+    }
+  }
+]') |>
+  as_tibble()
+
+incident_analysis_text <- reports_incidents_joined |>
+  filter(!is.na(incident_id)) |>
+  group_by(
+    incident_id,
+    incident_title,
+    incident_description,
+    incident_date
+  ) |>
+  summarise(
+    n_linked_reports = n_distinct(report_number),
+    report_text = str_c(
+      unique(
+        plain_text[
+          !is.na(plain_text) &
+            str_trim(plain_text) != ""
+        ]
+      ),
+      collapse = " "
+    ),
+    .groups = "drop"
+  ) |>
+  mutate(
+    analysis_text = str_to_lower(
+      str_c(
+        coalesce(incident_title, ""),
+        coalesce(incident_description, ""),
+        coalesce(report_text, ""),
+        sep = " "
+      )
+    )
+  )
+
+genai_pattern <- regex(
+  paste(
+    c(
+      "generative ai",
+      "generative artificial intelligence",
+      "large language model",
+      "large language models",
+      "\\bllm\\b",
+      "\\bllms\\b",
+      "chatgpt",
+      "openai",
+      "gpt-3",
+      "gpt-4",
+      "gpt-5",
+      "gemini",
+      "bard",
+      "claude",
+      "copilot",
+      "dall-e",
+      "dall·e",
+      "midjourney",
+      "stable diffusion",
+      "text generator",
+      "image generator",
+      "generative model",
+      "generative models"
+    ),
+    collapse = "|"
+  ),
+  ignore_case = TRUE
+)
+
+genai_incidents <- incident_analysis_text |>
+  filter(str_detect(analysis_text, genai_pattern))
+
+n_genai_incidents <- nrow(genai_incidents)
+
+genai_risks <- genai_incidents |>
+  mutate(
+    inaccurate_output = str_detect(
+      analysis_text,
+      regex(
+        paste(
+          c(
+            "hallucinat", "fabricat", "made up", "false information",
+            "incorrect information", "inaccurate information", "false claim",
+            "wrong answer", "incorrect answer", "misinformation", "invented",
+            "nonexistent"
+          ),
+          collapse = "|"
+        ),
+        ignore_case = TRUE
+      )
+    ),
+    unsafe_advice = str_detect(
+      analysis_text,
+      regex(
+        paste(
+          c(
+            "harmful advice", "unsafe advice", "dangerous advice",
+            "unsafe recommendation", "harmful recommendation", "self-harm",
+            "suicide advice", "medical advice", "legal advice"
+          ),
+          collapse = "|"
+        ),
+        ignore_case = TRUE
+      )
+    ),
+    privacy_data = str_detect(
+      analysis_text,
+      regex(
+        paste(
+          c(
+            "privacy", "personal data", "personal information",
+            "confidential information", "confidential data",
+            "sensitive information", "sensitive data", "data leak",
+            "data breach", "exposed data", "training data"
+          ),
+          collapse = "|"
+        ),
+        ignore_case = TRUE
+      )
+    ),
+    bias_discrimination = str_detect(
+      analysis_text,
+      regex(
+        paste(
+          c(
+            "\\bbias\\b", "\\bbiased\\b", "discriminat", "racial bias",
+            "gender bias", "stereotyp", "unequal treatment", "unfair treatment"
+          ),
+          collapse = "|"
+        ),
+        ignore_case = TRUE
+      )
+    ),
+    fraud_impersonation = str_detect(
+      analysis_text,
+      regex(
+        paste(
+          c(
+            "\\bfraud\\b", "\\bscam\\b", "\\bscams\\b", "impersonat",
+            "deepfake", "phishing", "identity theft", "fake voice",
+            "fake image", "fake video", "deceptive content"
+          ),
+          collapse = "|"
+        ),
+        ignore_case = TRUE
+      )
+    ),
+    automation_oversight = str_detect(
+      analysis_text,
+      regex(
+        paste(
+          c(
+            "automated decision", "automatic decision", "without human",
+            "human oversight", "human review", "lack of oversight",
+            "no oversight", "autonomous decision", "automated action"
+          ),
+          collapse = "|"
+        ),
+        ignore_case = TRUE
+      )
+    ),
+    security_misuse = str_detect(
+      analysis_text,
+      regex(
+        paste(
+          c(
+            "prompt injection", "jailbreak", "jailbreaking",
+            "security vulnerability", "cybersecurity", "\\bmalware\\b",
+            "\\bhack", "unauthorised access", "unauthorized access",
+            "security flaw", "security breach"
+          ),
+          collapse = "|"
+        ),
+        ignore_case = TRUE
+      )
+    )
+  )
+
+risk_prevalence <- genai_risks |>
+  summarise(
+    `Incorrect or fabricated output` = sum(inaccurate_output, na.rm = TRUE),
+    `Unsafe or harmful advice` = sum(unsafe_advice, na.rm = TRUE),
+    `Privacy or confidential-data risk` = sum(privacy_data, na.rm = TRUE),
+    `Bias or discrimination` = sum(bias_discrimination, na.rm = TRUE),
+    `Fraud or impersonation` = sum(fraud_impersonation, na.rm = TRUE),
+    `Automation or oversight failure` = sum(automation_oversight, na.rm = TRUE),
+    `Security or misuse` = sum(security_misuse, na.rm = TRUE)
+  ) |>
+  pivot_longer(
+    everything(),
+    names_to = "risk",
+    values_to = "n_incidents"
+  ) |>
+  mutate(
+    pct_incidents = ifelse(
+      n_genai_incidents > 0,
+      100 * n_incidents / n_genai_incidents,
+      NA_real_
+    )
+  ) |>
+  arrange(desc(n_incidents))
+
+genai_risks <- genai_risks |>
+  mutate(
+    n_failure_patterns = rowSums(
+      across(
+        c(
+          inaccurate_output,
+          unsafe_advice,
+          privacy_data,
+          bias_discrimination,
+          fraud_impersonation,
+          automation_oversight,
+          security_misuse
+        )
+      ),
+      na.rm = TRUE
+    )
+  )
+
+multi_risk_summary <- genai_risks |>
+  count(n_failure_patterns, name = "n_incidents")
+
+genai_control_gaps <- genai_risks |>
+  mutate(
+    verification_gap = str_detect(
+      analysis_text,
+      regex(
+        paste(
+          c(
+            "hallucinat", "fabricat", "false information",
+            "incorrect information", "inaccurate information", "wrong answer",
+            "failed to verify", "not verified", "unverified"
+          ),
+          collapse = "|"
+        ),
+        ignore_case = TRUE
+      )
+    ),
+    human_oversight_gap = str_detect(
+      analysis_text,
+      regex(
+        paste(
+          c(
+            "without human", "lack of human", "human oversight",
+            "lack of oversight", "no oversight", "human review",
+            "automated decision", "autonomous decision"
+          ),
+          collapse = "|"
+        ),
+        ignore_case = TRUE
+      )
+    ),
+    data_governance_gap = str_detect(
+      analysis_text,
+      regex(
+        paste(
+          c(
+            "privacy", "personal data", "personal information",
+            "confidential data", "sensitive data", "data leak",
+            "data breach", "training data"
+          ),
+          collapse = "|"
+        ),
+        ignore_case = TRUE
+      )
+    ),
+    security_control_gap = str_detect(
+      analysis_text,
+      regex(
+        paste(
+          c(
+            "prompt injection", "jailbreak", "security vulnerability",
+            "security flaw", "unauthorised access", "unauthorized access",
+            "cybersecurity"
+          ),
+          collapse = "|"
+        ),
+        ignore_case = TRUE
+      )
+    ),
+    fairness_governance_gap = str_detect(
+      analysis_text,
+      regex(
+        paste(
+          c(
+            "\\bbias\\b", "\\bbiased\\b", "discriminat", "stereotyp",
+            "unequal treatment", "unfair treatment"
+          ),
+          collapse = "|"
+        ),
+        ignore_case = TRUE
+      )
+    ),
+    misuse_abuse = str_detect(
+      analysis_text,
+      regex(
+        paste(
+          c(
+            "\\bfraud\\b", "\\bscam\\b", "impersonat", "deepfake",
+            "phishing", "malicious use", "misuse"
+          ),
+          collapse = "|"
+        ),
+        ignore_case = TRUE
+      )
+    )
+  )
+
+control_gap_prevalence <- genai_control_gaps |>
+  summarise(
+    `Verification or grounding gap` = sum(verification_gap, na.rm = TRUE),
+    `Human oversight gap` = sum(human_oversight_gap, na.rm = TRUE),
+    `Data-governance gap` = sum(data_governance_gap, na.rm = TRUE),
+    `Security-control gap` = sum(security_control_gap, na.rm = TRUE),
+    `Fairness-governance gap` = sum(fairness_governance_gap, na.rm = TRUE),
+    `Misuse or abuse` = sum(misuse_abuse, na.rm = TRUE)
+  ) |>
+  pivot_longer(
+    everything(),
+    names_to = "control_gap",
+    values_to = "n_incidents"
+  ) |>
+  arrange(desc(n_incidents))
+```
+
+## The question
+
+## How can SEC Victoria use generative AI without importing avoidable operational risk?
+
+::::: columns
+::: {.column width="50%"}
+### Potential uses
+
+- Retail customer support
+- Wholesale analysis and summarisation
+- Household-electrification guidance
+- Internal knowledge and drafting
+:::
+
+::: {.column width="50%"}
+### What we tested
+
+1.  Which failure patterns recur?
+2.  How widespread are they across incidents?
+3.  Where do they matter most for SEC?
+4.  Which safeguards are supported by the evidence?
+:::
+:::::
+
+## Why incident-level analysis matters
+
+::::: columns
+::: {.column width="52%"}
+```{r}
+#| label: fig-reports-per-incident-slides
+#| fig-width: 8
+#| fig-height: 4.4
+
+reports_per_incident |>
+  count(n_reports) |>
+  filter(n_reports <= 20) |>
+  ggplot(aes(x = n_reports, y = n)) +
+  geom_col(fill = "#006DAE") +
+  labs(
+    x = "Reports linked to one incident",
+    y = "Number of incidents"
+  ) +
+  theme_minimal(base_size = 18)
+```
+:::
+
+::: {.column width="48%"}
+### One event can attract many reports
+
+Raw report counts can over-emphasise highly publicised incidents.
+
+**Our solution:** use **distinct incidents** as the main unit of analysis so each underlying event receives equal weight.
+:::
+:::::
+
+## From AIID to the GenAI incident set
+
+::::: columns
+::: {.column width="55%"}
+### Reproducible screening approach
+
+An incident was included when its title, description or linked report text contained clear generative-AI terminology or major system names such as:
+
+**ChatGPT · GPT · Claude · Gemini · Copilot · Midjourney · Stable Diffusion · LLM**
+
+This is a screening rule, **not an official AIID taxonomy**.
+:::
+
+::: {.column width="45%"}
+### Analysis scope
+
+```{r}
+#| label: genai-scope-card
+#| results: asis
+
+cat(
+  paste0(
+    "<div class='metric-card'>",
+    "<strong>", format(n_incidents, big.mark = ","), "</strong><br>",
+    "AIID incidents<br><br>",
+    "<strong>", format(n_genai_incidents, big.mark = ","), "</strong><br>",
+    "identified by the GenAI screen",
+    "</div>"
+  )
+)
+```
+:::
+:::::
+
+## What goes wrong most often?
+
+```{r}
+#| label: fig-risk-prevalence-slides
+#| fig-width: 12
+#| fig-height: 5.2
+
+risk_prevalence |>
+  mutate(risk = forcats::fct_reorder(risk, n_incidents)) |>
+  ggplot(aes(x = risk, y = n_incidents)) +
+  geom_col(fill = "#006DAE") +
+  geom_text(
+    aes(label = scales::comma(n_incidents)),
+    hjust = -0.15,
+    size = 5
+  ) +
+  coord_flip(clip = "off") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    x = NULL,
+    y = "Number of identified GenAI incidents"
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+<p class="small-note">
+
+<strong>Interpretation:</strong> these are counts within the screened historical incident corpus, not probabilities of future SEC failures.
+
+</p>
+
+## Failures are often layered
+
+::::: columns
+::: {.column width="55%"}
+```{r}
+#| label: fig-multi-risk-slides
+#| fig-width: 8
+#| fig-height: 4.4
+
+multi_risk_summary |>
+  ggplot(aes(x = factor(n_failure_patterns), y = n_incidents)) +
+  geom_col(fill = "#006DAE") +
+  geom_text(
+    aes(label = scales::comma(n_incidents)),
+    vjust = -0.3,
+    size = 5
+  ) +
+  labs(
+    x = "Failure patterns identified in one incident",
+    y = "Number of incidents"
+  ) +
+  theme_minimal(base_size = 18)
+```
+:::
+
+::: {.column width="45%"}
+### The implication
+
+A single safeguard is unlikely to be enough.
+
+SEC should combine:
+
+- verification and grounding;
+- human oversight;
+- data governance;
+- security controls; and
+- fairness monitoring.
+:::
+:::::
+
+## Where controls appear to break down
+
+```{r}
+#| label: fig-control-gap-slides
+#| fig-width: 12
+#| fig-height: 5.2
+
+control_gap_prevalence |>
+  mutate(
+    control_gap = forcats::fct_reorder(control_gap, n_incidents)
+  ) |>
+  ggplot(aes(x = control_gap, y = n_incidents)) +
+  geom_col(fill = "#D93F00") +
+  geom_text(
+    aes(label = scales::comma(n_incidents)),
+    hjust = -0.15,
+    size = 5
+  ) +
+  coord_flip(clip = "off") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    x = NULL,
+    y = "Number of identified GenAI incidents"
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+<p class="small-note">
+
+These indicators are <strong>proxies for observable control gaps</strong>, not proof of causation.
+
+</p>
+
+## What this means for SEC Victoria
+
+:::::: columns
+::: {.column width="33%"}
+### Retail
+
+**Main exposures**
+
+- Incorrect tariff or account information
+- Customer-data leakage
+- Unequal responses
+- Staff over-reliance on generated answers
+
+**Control focus:** trusted sources + human checking
+:::
+
+::: {.column width="33%"}
+### Wholesale
+
+**Main exposures**
+
+- Unsupported market claims
+- Commercially sensitive information
+- Prompt injection or malicious content
+- Unchecked analytical assumptions
+
+**Control focus:** verification + access controls
+:::
+
+::: {.column width="33%"}
+### Household electrification
+
+**Main exposures**
+
+- Incorrect technology or eligibility guidance
+- Unsafe recommendations
+- Household-data privacy
+- Unequal quality of advice
+
+**Control focus:** qualified review + clear escalation
+:::
+::::::
+
+## Safeguards linked to the evidence
+
+| Evidence pattern | Practical SEC safeguard |
+|----|----|
+| Incorrect or fabricated output | Ground answers in approved SEC sources and independently verify consequential outputs |
+| Privacy or confidential-data risk | Data classification, approved-model rules, role-based access and logging |
+| Unsafe or harmful advice | Prohibited advice categories, escalation rules and qualified human review |
+| Automation or oversight failure | Keep high-consequence uses advisory-only and require explicit approval |
+| Security or misuse | Prompt-injection testing, monitoring and isolation from critical infrastructure |
+| Bias or discrimination | Test across relevant customer groups and review disputed or harmful outputs |
+
+## Recommended rollout model
+
+:::::: columns
+::: {.column width="33%"}
+### Tier 1
+
+#### Low consequence
+
+**Examples**
+
+- Internal drafting
+- Non-sensitive summarisation
+- Brainstorming
+- Formatting
+
+**Controls**
+
+Light controls + staff verification
+:::
+
+::: {.column width="33%"}
+### Tier 2
+
+#### Decision support
+
+**Examples**
+
+- Customer support
+- Product explanations
+- Electrification guidance
+- Market analysis
+
+**Controls**
+
+Approved sources + monitoring + human review
+:::
+
+::: {.column width="33%"}
+### Tier 3
+
+#### High consequence
+
+**Examples**
+
+- Automated customer decisions
+- Sensitive commercial actions
+- Safety-sensitive recommendations
+- Critical operational systems
+
+**Controls**
+
+Keep AI **advisory, not autonomous**, unless substantially stronger assurance is demonstrated
+:::
+::::::
+
+## Four takeaways for SEC Victoria
+
+1.  **Count incidents, not headlines.** Reporting intensity is uneven, so incident-level analysis is more defensible.
+
+2.  **No single failure dominates.** GenAI risk spans accuracy, privacy, safety, fairness, misuse and oversight.
+
+3.  **Controls need to work together.** Multiple failure patterns can appear in the same incident.
+
+4.  **Control strength should follow consequence.** Customer, commercial and household decisions need more assurance than low-risk drafting.
+
+## What the evidence does — and does not — show
+
+::::: columns
+::: {.column width="50%"}
+### Supports
+
+- Historical incident-pattern analysis
+- Comparison of recurring failure mechanisms
+- Prioritisation of safeguards
+- A risk-tiered deployment approach
+:::
+
+::: {.column width="50%"}
+### Does not support
+
+- A forecast of SEC Victoria's future failure probability
+- Population-wide GenAI failure rates
+- Definitive causal attribution from keyword indicators
+- Perfect coverage of multilingual incidents
+:::
+:::::
+
+## Recommendation
+
+## Introduce generative AI progressively — with stronger safeguards as consequences increase.
+
+**Verify against trusted SEC sources.**\
+**Keep meaningful human oversight.**\
+**Restrict sensitive information.**\
+**Keep high-consequence GenAI advisory rather than autonomous.**
+
+::: notes
+The AI Incident Database suggests that the central issue is not whether generative AI can produce useful outputs, but whether those outputs can be trusted and governed when they affect customers, commercially sensitive information and household energy decisions.
+:::

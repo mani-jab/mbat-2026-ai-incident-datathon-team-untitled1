@@ -1,0 +1,65 @@
+# ----------------------------
+# R / RStudio
+# ----------------------------
+.Rhistory
+.Rapp.history
+.RData
+.RDataTmp
+.Ruserdata
+.Rproj.user/
+
+# ----------------------------
+# Quarto / R Markdown temporary files
+# ----------------------------
+.quarto/
+**/.quarto/
+*_cache/
+cache/
+*.utf8.md
+*.knit.md
+**/*.quarto_ipynb
+
+# ----------------------------
+# Secrets / credentials
+# ----------------------------
+.Renviron
+.Renviron.*
+!.Renviron.example
+.env
+.env.*
+.httr-oauth
+
+# ----------------------------
+# macOS / OS junk
+# ----------------------------
+.DS_Store
+**/.DS_Store
+
+# ----------------------------
+# Local-only data / temporary outputs
+# ----------------------------
+.local-data/
+**/local_results.rds
+
+# ----------------------------
+# R package / build files
+# ----------------------------
+*-Ex.R
+/*.tar.gz
+/*.Rcheck/
+
+# ----------------------------
+# Generated vignette files
+# ----------------------------
+vignettes/*.html
+vignettes/*.pdf
+
+# ----------------------------
+# Translation temp files
+# ----------------------------
+po/*~
+
+# ----------------------------
+# RStudio Connect
+# ----------------------------
+rsconnect/

@@ -1,0 +1,7 @@
+"metric","value"
+"Reports selected",3087
+"Missing or non-string original bodies",0
+"Original bodies empty/whitespace only",45
+"Usable cleaned bodies",3042
+"Non-empty originals becoming empty",0
+"Exact-duplicate cleaned-body groups",34
